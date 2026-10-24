@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
-import 'homeScreen.dart'; // Make sure this matches your home screen file name exactly
+import 'homeScreen.dart'; // Ensure globalCart is accessible
 import '../app_router.dart';
 
 class CartScreen extends StatefulWidget {
@@ -15,12 +15,13 @@ class _CartScreenState extends State<CartScreen> {
   bool _isCheckingOut = false;
 
   void _msg(String text, Color color) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).clearSnackBars();
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(SnackBar(content: Text(text), backgroundColor: color));
   }
 
-  // calculate kora total price:
   double get _totalPrice {
     double total = 0.0;
     for (final item in globalCart) {
@@ -31,60 +32,54 @@ class _CartScreenState extends State<CartScreen> {
     return total;
   }
 
-  // process check kora and balance minus korbe.
+  // ATOMIC CHECKOUT PROCESS
   Future<void> _processCheckout() async {
     if (globalCart.isEmpty) return;
     final userId = _supabase.auth.currentUser?.id;
-    if (userId == null) return;
-
-    final totalPrice = _totalPrice;
-    final itemsSummary = globalCart
-        .map((i) => "${i['qty']}x ${i['name']}")
-        .join(', ');
+    if (userId == null) {
+      _msg('Authentication error. Please log in again.', Colors.redAccent);
+      return;
+    }
 
     setState(() => _isCheckingOut = true);
 
     try {
-      // 1. check korbe student wallet (FIXED: student_id -> user_id)
-      final wallet = await _supabase
-          .from('wallets')
-          .select()
-          .eq('user_id', userId)
-          .maybeSingle();
+      final totalPrice = _totalPrice;
 
-      double balance = (wallet?['balance'] as num?)?.toDouble() ?? 0.0;
+      // Format cart into a JSON-compatible list for PostgreSQL
+      final List<Map<String, dynamic>> cartPayload = globalCart.map((item) {
+        return {
+          'id':
+              item['id'], // CRITICAL: The menu item's UUID must be in the cart
+          'qty': (item['qty'] as num?)?.toInt() ?? 1,
+        };
+      }).toList();
 
-      if (balance < totalPrice) {
-        _msg(
-          'Insufficient wallet balance! Please top up at the cashier desk.',
-          Colors.redAccent,
-        );
-        setState(() => _isCheckingOut = false);
-        return;
-      }
+      final itemsSummary = globalCart
+          .map((i) => "${i['qty']}x ${i['name']}")
+          .join(', ');
 
-      // 2. wallet theke balance kata: (FIXED: student_id -> user_id)
-      final newBalance = balance - totalPrice;
-      await _supabase.from('wallets').upsert({
-        'user_id': userId,
-        'balance': newBalance,
-      }, onConflict: 'user_id');
+      // Trigger the atomic PL/pgSQL transaction
+      await _supabase.rpc(
+        'process_checkout',
+        params: {
+          'p_user_id': userId,
+          'p_total_price': totalPrice,
+          'p_items_summary': itemsSummary,
+          'p_cart_items': cartPayload,
+        },
+      );
 
-      //3. inset korbe oder : order table e for kitchen (KDS);
-      await _supabase.from('orders').insert({
-        'user_id': userId,
-        'total_amount': totalPrice,
-        'items_summary': itemsSummary,
-        'status': 'Pending',
-      });
-
-      // 4. cart remove korar jonne.//
+      // Clear volatile memory only after database confirms success
       setState(() => globalCart.clear());
 
       _msg('Order placed successfully!', Colors.green);
 
       if (!mounted) return;
       Navigator.pushReplacementNamed(context, AppRoutes.orderTracker);
+    } on PostgrestException catch (e) {
+      // Catches custom RAISE EXCEPTION messages from the PostgreSQL RPC
+      _msg(e.message, Colors.redAccent);
     } catch (e) {
       _msg('Checkout failed: $e', Colors.redAccent);
     } finally {
@@ -107,7 +102,6 @@ class _CartScreenState extends State<CartScreen> {
         padding: const EdgeInsets.all(16.0),
         child: Column(
           children: [
-            // --- CART ITEMS LIST OR EMPTY STATE ---
             Expanded(
               child: globalCart.isEmpty
                   ? Container(
@@ -229,8 +223,6 @@ class _CartScreenState extends State<CartScreen> {
                     ),
             ),
             const SizedBox(height: 16),
-
-            // checkout summary cart://
             Container(
               padding: const EdgeInsets.all(20),
               decoration: BoxDecoration(
